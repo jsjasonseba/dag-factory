@@ -331,7 +331,9 @@ class DagBuilder:
     # pylint: disable=too-many-statements
     # pylint: disable=too-many-locals
     @staticmethod
-    def make_task(operator: str, task_params: Dict[str, Any]) -> BaseOperator:
+    def make_task(
+        operator: str, task_params: Dict[str, Any], tasks_dict: Dict[str, BaseOperator] | None = None
+    ) -> BaseOperator:
         """
         Takes an operator and params and creates an instance of that operator.
 
@@ -408,6 +410,11 @@ class DagBuilder:
             # If there are partial_kwargs we should merge them with existing task_params
             if partial_kwargs and not utils.is_partial_duplicated(partial_kwargs, task_params):
                 task_params.update(partial_kwargs)
+
+        if tasks_dict is not None:
+            for field in operator_obj.template_fields:
+                if field in task_params:
+                    task_params[field] = DagBuilder._resolve_output_references(task_params[field], tasks_dict)
 
         task: Union[BaseOperator, MappedOperator] = (
             operator_obj(**task_params)
@@ -564,6 +571,41 @@ class DagBuilder:
                     source.set_upstream(dep)
 
     @staticmethod
+    def _resolve_output_references(value: Any, tasks_dict: Dict[str, BaseOperator]) -> Any:
+        """Resolve native operator output references without evaluating Python expressions."""
+        if isinstance(value, dict):
+            return {key: DagBuilder._resolve_output_references(item, tasks_dict) for key, item in value.items()}
+        if isinstance(value, list):
+            return [DagBuilder._resolve_output_references(item, tasks_dict) for item in value]
+        if isinstance(value, tuple):
+            return tuple(DagBuilder._resolve_output_references(item, tasks_dict) for item in value)
+        if not isinstance(value, str):
+            return value
+
+        match = re.fullmatch(r"([\w.-]+)\.output(?:\[(.*)\])?", value)
+        legacy_match = re.fullmatch(r"XcomArg\(([\w.-]+)\)", value)
+        if not match and not legacy_match:
+            return value
+
+        task_id = (match or legacy_match).group(1)
+        key = None
+        if match and match.group(2) is not None:
+            try:
+                key = ast.literal_eval(match.group(2))
+            except (ValueError, SyntaxError) as error:
+                raise DagFactoryConfigException(f"XCom key must be a quoted string in {value!r}") from error
+            if not isinstance(key, str):
+                raise DagFactoryConfigException(f"XCom key must be a quoted string in {value!r}")
+
+        if task_id not in tasks_dict:
+            raise DagFactoryConfigException(
+                f"Task {task_id!r} referenced by {value!r} has not been created. "
+                "Declare it in dependencies so it is built first."
+            )
+        output = tasks_dict[task_id].output
+        return output if key is None else output[key]
+
+    @staticmethod
     def replace_expand_values(task_conf: Dict, tasks_dict: Dict[str, BaseOperator]):
         """
         Replaces any expand values in the task configuration with their corresponding XComArg value.
@@ -577,14 +619,9 @@ class DagBuilder:
         """
 
         for expand_key, expand_value in task_conf["expand"].items():
-            if ".output" in expand_value:
-                task_id = expand_value.split(".output")[0]
-                if task_id in tasks_dict:
-                    task_conf["expand"][expand_key] = tasks_dict[task_id].output
-            elif "XcomArg" in expand_value:
-                task_id = re.findall(r"\(+(.*?)\)", expand_value)[0]
-                if task_id in tasks_dict:
-                    task_conf["expand"][expand_key] = tasks_dict[task_id].output
+            # Static lists and dictionaries are mapping payloads, not reference expressions.
+            if isinstance(expand_value, str):
+                task_conf["expand"][expand_key] = DagBuilder._resolve_output_references(expand_value, tasks_dict)
         return task_conf
 
     @staticmethod
@@ -978,7 +1015,9 @@ class DagBuilder:
                 if task_conf.get("expand"):
                     task_conf = self.replace_expand_values(task_conf, tasks_dict)
 
-                task: Union[BaseOperator, MappedOperator] = DagBuilder.make_task(operator=operator, task_params=params)
+                task: Union[BaseOperator, MappedOperator] = DagBuilder.make_task(
+                    operator=operator, task_params=params, tasks_dict=tasks_dict
+                )
                 tasks_dict[task.task_id]: BaseOperator = task
 
             elif "decorator" in task_conf:
